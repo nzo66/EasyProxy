@@ -52,7 +52,7 @@ if DLHD_PROXIES: logging.info(f"📺 Caricati {len(DLHD_PROXIES)} proxy DLHD.")
 
 API_PASSWORD = os.environ.get("API_PASSWORD")
 
-# ✅ COSTANTE USER-AGENT: Forziamo Chrome per evitare blocchi 451/403
+# ✅ COSTANTE USER-AGENT: Forziamo Chrome per evitare blocchi 451/403 (Mediaset e altri)
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 def check_password(request):
@@ -125,6 +125,12 @@ try:
 except ImportError:
     logger.warning("⚠️ Modulo StreamtapeExtractor non trovato.")
 
+try:
+    from extractors.orion import OrionExtractor
+    logger.info("✅ Modulo OrionExtractor caricato.")
+except ImportError:
+    logger.warning("⚠️ Modulo OrionExtractor non trovato.")
+
 # --- Classi Unite ---
 class ExtractorError(Exception):
     """Eccezione personalizzata per errori di estrazione"""
@@ -173,16 +179,22 @@ class GenericHLSExtractor:
         parsed_url = urlparse(url)
         origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
         
+        # Normalizza headers base
         headers = {k: v for k, v in self.base_headers.items()}
         headers["Referer"] = origin
         headers["Origin"] = origin
 
         for h, v in self.request_headers.items():
-            if h.lower() in ["authorization", "x-api-key", "x-auth-token"]:
+            if h.lower() in ["authorization", "x-api-key", "x-auth-token", "cookie"]:
                 headers[h] = v
             # Se l'estrattore ha header specifici passati (es. da VixSrc), usali
+            # ma non sovrascrivere User-Agent se non strettamente necessario
             elif h.lower() == "referer":
                 headers[h] = v
+            
+            # Filtra header che potrebbero esporre IP
+            if h.lower() in ["x-forwarded-for", "x-real-ip", "forwarded", "via"]:
+                continue
 
         return {
             "destination_url": url, 
@@ -194,7 +206,7 @@ class GenericHLSExtractor:
         if self.session and not self.session.closed:
             await self.session.close()
 
-# ✅ CLASSE COMPLETA E CORRETTA PER MPD LIVE (RAI)
+# ✅ CLASSE COMPLETA E CORRETTA PER MPD LIVE (RAI) E VOD
 class MPDToHLSConverter:
     """Converte manifest MPD (DASH) in playlist HLS (m3u8) on-the-fly."""
     
@@ -228,6 +240,7 @@ class MPDToHLSConverter:
             for adaptation_set in root.findall('.//mpd:AdaptationSet', self.ns):
                 mime_type = adaptation_set.get('mimeType', '')
                 content_type = adaptation_set.get('contentType', '')
+                
                 if 'video' in mime_type or 'video' in content_type:
                     video_sets.append(adaptation_set)
                 elif 'audio' in mime_type or 'audio' in content_type:
@@ -277,7 +290,6 @@ class MPDToHLSConverter:
                         inf += f',FRAME-RATE={frame_rate}'
                     if codecs:
                         inf += f',CODECS="{codecs}"'
-                    
                     if has_audio:
                         inf += f',AUDIO="{audio_group_id}"'
                     
@@ -342,6 +354,7 @@ class MPDToHLSConverter:
                 start_number = int(segment_template.get('startNumber', '1'))
                 duration = int(segment_template.get('duration', '0'))
                 
+                # Risoluzione BaseURL in cascata
                 current_base = os.path.dirname(original_url)
                 if not current_base.endswith('/'): current_base += '/'
 
@@ -372,6 +385,7 @@ class MPDToHLSConverter:
 
                 segment_timeline = segment_template.find('mpd:SegmentTimeline', self.ns)
                 
+                # --- CASO 1: SegmentTimeline (Esplicito) ---
                 if segment_timeline is not None:
                     current_time = 0
                     segment_number = start_number
@@ -417,6 +431,7 @@ class MPDToHLSConverter:
                             proxy_seg_url = f"{proxy_base}/segment/{seg_name}?base_url={encoded_seg_url}{params}"
                             lines.append(proxy_seg_url)
 
+                # --- CASO 2: SegmentTemplate SENZA Timeline (Basato su Duration) ---
                 else:
                     duration_sec = duration / timescale
                     lines.insert(2, f'#EXT-X-TARGETDURATION:{int(duration_sec) + 1}')
@@ -427,9 +442,11 @@ class MPDToHLSConverter:
                         now = datetime.now(timezone.utc)
                         elapsed_seconds = (now - avail_start).total_seconds()
                         
+                        # Buffer di sicurezza
                         buffer_seconds = 20 
                         current_sequence_number = start_number + int((elapsed_seconds - buffer_seconds) / duration_sec)
                         
+                        # Ultimi 10 segmenti
                         num_segments_in_playlist = 10
                         start_seq = max(start_number, current_sequence_number - num_segments_in_playlist + 1)
                         
@@ -465,8 +482,6 @@ class MPDToHLSConverter:
 
         except Exception as e:
             logging.error(f"Errore conversione Media Playlist: {e}")
-            import traceback
-            traceback.print_exc()
             return "#EXTM3U\n#EXT-X-ERROR: " + str(e)
 
 class HLSProxy:
@@ -539,8 +554,13 @@ class HLSProxy:
                 if key not in self.extractors:
                     self.extractors[key] = StreamtapeExtractor(request_headers, proxies=GLOBAL_PROXIES)
                 return self.extractors[key]
+            elif "orionoid.com" in url:
+                key = "orion"
+                if key not in self.extractors:
+                    self.extractors[key] = OrionExtractor(request_headers, proxies=GLOBAL_PROXIES)
+                return self.extractors[key]
             else:
-                # ✅ MODIFICATO: Fallback al GenericHLSExtractor per qualsiasi altro URL.
+                # Fallback al GenericHLSExtractor
                 key = "hls_generic"
                 if key not in self.extractors:
                     self.extractors[key] = GenericHLSExtractor(request_headers, proxies=GLOBAL_PROXIES)
@@ -573,7 +593,6 @@ class HLSProxy:
             print(f"   Headers: {dict(request.headers)}")
             
             extractor = await self.get_extractor(target_url, dict(request.headers))
-            print(f"   Extractor: {type(extractor).__name__}")
             
             try:
                 result = await extractor.extract(target_url, force_refresh=force_refresh)
@@ -608,6 +627,7 @@ class HLSProxy:
                 for param_name, param_value in request.query.items():
                     if param_name.startswith('h_'):
                         header_name = param_name[2:]
+                        # Rimuovi duplicati case-insensitive
                         for k in list(stream_headers.keys()):
                             if k.lower() == header_name.lower():
                                 del stream_headers[k]
@@ -638,279 +658,6 @@ class HLSProxy:
             logger.critical(f"❌ Errore critico con {extractor_name}: {e}")
             logger.exception(f"Errore nella richiesta proxy: {str(e)}")
             return web.Response(text=f"Errore proxy: {str(e)}", status=500)
-
-    async def handle_extractor_request(self, request):
-        """Endpoint compatibile con MediaFlow-Proxy per ottenere informazioni sullo stream."""
-        logger.info(f"📥 Extractor Request: {request.url}")
-        
-        if not check_password(request):
-            logger.warning("⛔ Unauthorized extractor request")
-            return web.Response(status=401, text="Unauthorized: Invalid API Password")
-
-        try:
-            url = request.query.get('url') or request.query.get('d')
-            if not url:
-                return web.Response(text="Missing url or d parameter", status=400)
-
-            try:
-                url = urllib.parse.unquote(url)
-            except:
-                pass
-
-            redirect_stream = request.query.get('redirect_stream', 'false').lower() == 'true'
-            logger.info(f"🔍 Extracting: {url} (Redirect: {redirect_stream})")
-
-            extractor = await self.get_extractor(url, dict(request.headers))
-            result = await extractor.extract(url)
-            
-            stream_url = result["destination_url"]
-            stream_headers = result.get("request_headers", {})
-            mediaflow_endpoint = result.get("mediaflow_endpoint", "hls_proxy")
-            
-            logger.info(f"✅ Extraction success: {stream_url[:50]}... Endpoint: {mediaflow_endpoint}")
-
-            scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
-            host = request.headers.get('X-Forwarded-Host', request.host)
-            proxy_base = f"{scheme}://{host}"
-            
-            endpoint = "/proxy/hls/manifest.m3u8"
-            if mediaflow_endpoint == "proxy_stream_endpoint" or ".mp4" in stream_url or ".mkv" in stream_url or ".avi" in stream_url:
-                 endpoint = "/proxy/stream"
-            elif ".mpd" in stream_url:
-                endpoint = "/proxy/mpd/manifest.m3u8"
-
-            encoded_url = urllib.parse.quote(stream_url, safe='')
-            header_params = "".join([f"&h_{urllib.parse.quote(key)}={urllib.parse.quote(value)}" for key, value in stream_headers.items()])
-            
-            api_password = request.query.get('api_password')
-            if api_password:
-                header_params += f"&api_password={api_password}"
-
-            proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
-
-            if redirect_stream:
-                logger.info(f"↪️ Redirecting to: {proxy_url}")
-                return web.HTTPFound(proxy_url)
-
-            response_data = {
-                "destination_url": stream_url,
-                "request_headers": stream_headers,
-                "mediaflow_endpoint": mediaflow_endpoint,
-                "mediaflow_proxy_url": proxy_url,
-                "query_params": {}
-            }
-            
-            logger.info(f"✅ Extractor OK: {url} -> {stream_url[:50]}...")
-            return web.json_response(response_data)
-
-        except Exception as e:
-            error_message = str(e).lower()
-            is_expected_error = any(x in error_message for x in [
-                'not found', 'unavailable', '403', 'forbidden', 
-                '502', 'bad gateway', 'timeout', 'temporarily unavailable'
-            ])
-            
-            if is_expected_error:
-                logger.warning(f"⚠️ Extractor request failed (expected error): {e}")
-            else:
-                logger.error(f"❌ Error in extractor request: {e}")
-                import traceback
-                traceback.print_exc()
-            
-            return web.Response(text=str(e), status=500)
-
-    async def handle_license_request(self, request):
-        """Gestisce le richieste di licenza DRM (ClearKey e Proxy)"""
-        try:
-            clearkey_param = request.query.get('clearkey')
-            if clearkey_param:
-                logger.info(f"🔑 Richiesta licenza ClearKey statica: {clearkey_param}")
-                try:
-                    kid_hex, key_hex = clearkey_param.split(':')
-                    def hex_to_b64url(hex_str):
-                        return base64.urlsafe_b64encode(binascii.unhexlify(hex_str)).decode('utf-8').rstrip('=')
-                    jwk_response = {
-                        "keys": [{
-                            "kty": "oct",
-                            "k": hex_to_b64url(key_hex),
-                            "kid": hex_to_b64url(kid_hex),
-                            "type": "temporary"
-                        }],
-                        "type": "temporary"
-                    }
-                    logger.info(f"🔑 Serving static ClearKey license for KID: {kid_hex}")
-                    return web.json_response(jwk_response)
-                except Exception as e:
-                    logger.error(f"❌ Errore nella generazione della licenza ClearKey statica: {e}")
-                    return web.Response(text="Invalid ClearKey format", status=400)
-
-            license_url = request.query.get('url')
-            if not license_url:
-                return web.Response(text="Missing url parameter", status=400)
-
-            license_url = urllib.parse.unquote(license_url)
-            
-            headers = {}
-            for param_name, param_value in request.query.items():
-                if param_name.startswith('h_'):
-                    header_name = param_name[2:].replace('_', '-')
-                    headers[header_name] = param_value
-
-            if request.headers.get('Content-Type'):
-                headers['Content-Type'] = request.headers.get('Content-Type')
-
-            body = await request.read()
-            logger.info(f"🔐 Proxying License Request to: {license_url}")
-            
-            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
-            connector_kwargs = {}
-            if proxy:
-                connector_kwargs['proxy'] = proxy
-            
-            async with ClientSession() as session:
-                async with session.request(
-                    request.method, 
-                    license_url, 
-                    headers=headers, 
-                    data=body, 
-                    **connector_kwargs
-                ) as resp:
-                    response_body = await resp.read()
-                    logger.info(f"✅ License response: {resp.status} ({len(response_body)} bytes)")
-                    
-                    response_headers = {
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Allow-Headers": "*",
-                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
-                    }
-                    if 'Content-Type' in resp.headers:
-                        response_headers['Content-Type'] = resp.headers['Content-Type']
-
-                    return web.Response(
-                        body=response_body,
-                        status=resp.status,
-                        headers=response_headers
-                    )
-
-        except Exception as e:
-            logger.error(f"❌ License proxy error: {str(e)}")
-            return web.Response(text=f"License error: {str(e)}", status=500)
-
-    async def handle_key_request(self, request):
-        """Gestisce richieste per chiavi AES-128"""
-        if not check_password(request):
-            return web.Response(status=401, text="Unauthorized: Invalid API Password")
-
-        static_key = request.query.get('static_key')
-        if static_key:
-            try:
-                key_bytes = binascii.unhexlify(static_key)
-                return web.Response(
-                    body=key_bytes,
-                    content_type='application/octet-stream',
-                    headers={'Access-Control-Allow-Origin': '*'}
-                )
-            except Exception as e:
-                logger.error(f"❌ Errore decodifica chiave statica: {e}")
-                return web.Response(text="Invalid static key", status=400)
-
-        key_url = request.query.get('key_url')
-        
-        if not key_url:
-            return web.Response(text="Missing key_url or static_key parameter", status=400)
-        
-        try:
-            try:
-                key_url = urllib.parse.unquote(key_url)
-            except:
-                pass
-                
-            headers = {}
-            for param_name, param_value in request.query.items():
-                if param_name.startswith('h_'):
-                    header_name = param_name[2:].replace('_', '-')
-                    if header_name.lower() == 'range':
-                        continue
-                    headers[header_name] = param_value
-
-            logger.info(f"🔑 Fetching AES key from: {key_url}")
-            
-            proxy_list = GLOBAL_PROXIES
-            original_channel_url = request.query.get('original_channel_url')
-
-            if "newkso.ru" in key_url or (original_channel_url and any(domain in original_channel_url for domain in ["daddylive", "dlhd"])):
-                proxy_list = DLHD_PROXIES or GLOBAL_PROXIES
-            elif original_channel_url and "vavoo.to" in original_channel_url:
-                proxy_list = VAVOO_PROXIES or GLOBAL_PROXIES
-            
-            proxy = random.choice(proxy_list) if proxy_list else None
-            connector_kwargs = {}
-            if proxy:
-                connector_kwargs['proxy'] = proxy
-                logger.info(f"Utilizzo del proxy {proxy} per la richiesta della chiave.")
-            
-            timeout = ClientTimeout(total=30)
-            async with ClientSession(timeout=timeout) as session:
-                async with session.get(key_url, headers=headers, **connector_kwargs) as resp:
-                    if resp.status == 200 or resp.status == 206:
-                        key_data = await resp.read()
-                        logger.info(f"✅ AES key fetched successfully: {len(key_data)} bytes")
-                        
-                        return web.Response(
-                            body=key_data,
-                            content_type="application/octet-stream",
-                            headers={
-                                "Access-Control-Allow-Origin": "*",
-                                "Access-Control-Allow-Headers": "*",
-                                "Cache-Control": "no-cache, no-store, must-revalidate"
-                            }
-                        )
-                    else:
-                        logger.error(f"❌ Key fetch failed with status: {resp.status}")
-                        try:
-                            url_param = request.query.get('original_channel_url')
-                            if url_param:
-                                extractor = await self.get_extractor(url_param, {})
-                                if hasattr(extractor, 'invalidate_cache_for_url'):
-                                    await extractor.invalidate_cache_for_url(url_param)
-                        except Exception as cache_e:
-                            logger.error(f"⚠️ Errore durante l'invalidazione automatica della cache: {cache_e}")
-                        return web.Response(text=f"Key fetch failed: {resp.status}", status=resp.status)
-                        
-        except Exception as e:
-            logger.error(f"❌ Error fetching AES key: {str(e)}")
-            return web.Response(text=f"Key error: {str(e)}", status=500)
-
-    async def handle_ts_segment(self, request):
-        """Gestisce richieste per segmenti .ts"""
-        try:
-            segment_name = request.match_info.get('segment')
-            base_url = request.query.get('base_url')
-            
-            if not base_url:
-                return web.Response(text="Base URL mancante per segmento", status=400)
-            
-            base_url = urllib.parse.unquote(base_url)
-            
-            if base_url.endswith('/'):
-                segment_url = f"{base_url}{segment_name}"
-            else:
-                if any(ext in base_url for ext in ['.mp4', '.m4s', '.ts', '.m4i', '.m4a', '.m4v']):
-                    segment_url = base_url
-                else:
-                    segment_url = f"{base_url.rsplit('/', 1)[0]}/{segment_name}"
-            
-            logger.info(f"📦 Proxy Segment: {segment_name}")
-            
-            # ✅ FIX: Usa sempre DEFAULT_USER_AGENT
-            return await self._proxy_stream(request, segment_url, {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "Referer": base_url
-            })
-            
-        except Exception as e:
-            logger.error(f"Errore nel proxy segmento .ts: {str(e)}")
-            return web.Response(text=f"Errore segmento: {str(e)}", status=500)
 
     async def _proxy_stream(self, request, stream_url, stream_headers):
         """Effettua il proxy dello stream con gestione manifest e AES-128"""
@@ -1180,7 +927,7 @@ class HLSProxy:
             return manifest_content 
 
     async def _rewrite_manifest_urls(self, manifest_content: str, base_url: str, proxy_base: str, stream_headers: dict, original_channel_url: str = '', api_password: str = None) -> str:
-        """Riscrive gli URL nei manifest HLS per passare attraverso il proxy (incluse chiavi AES)"""
+        """Riscrive gli URL nei manifest HLS per passare attraverso il proxy (incluse chiavi AES e I-Frame)"""
         lines = manifest_content.split('\n')
         rewritten_lines = []
         
@@ -1238,7 +985,7 @@ class HLSProxy:
                 else:
                     rewritten_lines.append(line)
             
-            # ✅ FIX: Gestione unificata playlist (AUDIO, VIDEO e I-FRAME) -> /proxy/hls/
+            # ✅ FIX: Handle both MEDIA and I-FRAME-STREAM-INF -> vanno al parser manifest
             elif (line.startswith('#EXT-X-MEDIA:') or line.startswith('#EXT-X-I-FRAME-STREAM-INF:')) and 'URI=' in line:
                 uri_start = line.find('URI="') + 5
                 uri_end = line.find('"', uri_start)
@@ -1258,11 +1005,11 @@ class HLSProxy:
                 
                 # ✅ FIX CRITICO: Distingui Segmenti da Playlist!
                 path = urlparse(absolute_url).path.lower()
+                # Se sembra una playlist o un manifest, usa il parser
                 if any(x in path for x in ['.m3u8', '.php', '.mpd', '.isml/manifest', 'playlist']):
-                    # Playlist -> Parser
                     proxy_url = f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_url}{header_params}"
                 else:
-                    # Segmenti (ts, mp4, aac) -> Stream diretto
+                    # Altrimenti (ts, m4s, mp4, aac) usa lo stream diretto
                     proxy_url = f"{proxy_base}/proxy/stream?d={encoded_url}{header_params}"
                 
                 rewritten_lines.append(proxy_url)
@@ -1272,56 +1019,363 @@ class HLSProxy:
         
         return '\n'.join(rewritten_lines)
 
-    async def handle_playlist_request(self, request):
-        """Gestisce le richieste per il playlist builder"""
-        if not self.playlist_builder:
-            return web.Response(text="❌ Playlist Builder non disponibile - modulo mancante", status=503)
-            
+    async def handle_extractor_request(self, request):
+        """Endpoint compatibile con MediaFlow-Proxy per ottenere informazioni sullo stream."""
+        logger.info(f"📥 Extractor Request: {request.url}")
+        
+        if not check_password(request):
+            logger.warning("⛔ Unauthorized extractor request")
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+
         try:
-            url_param = request.query.get('url')
+            url = request.query.get('url') or request.query.get('d')
+            if not url:
+                return web.Response(text="Missing url or d parameter", status=400)
+
+            try:
+                url = urllib.parse.unquote(url)
+            except:
+                pass
+
+            redirect_stream = request.query.get('redirect_stream', 'false').lower() == 'true'
+            logger.info(f"🔍 Extracting: {url} (Redirect: {redirect_stream})")
+
+            extractor = await self.get_extractor(url, dict(request.headers))
+            result = await extractor.extract(url)
             
-            if not url_param:
-                return web.Response(text="Parametro 'url' mancante", status=400)
+            stream_url = result["destination_url"]
+            stream_headers = result.get("request_headers", {})
+            mediaflow_endpoint = result.get("mediaflow_endpoint", "hls_proxy")
             
-            if not url_param.strip():
-                return web.Response(text="Parametro 'url' non può essere vuoto", status=400)
-            
-            playlist_definitions = [def_.strip() for def_ in url_param.split(';') if def_.strip()]
-            if not playlist_definitions:
-                return web.Response(text="Nessuna definizione playlist valida trovata", status=400)
-            
+            logger.info(f"✅ Extraction success: {stream_url[:50]}... Endpoint: {mediaflow_endpoint}")
+
             scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
             host = request.headers.get('X-Forwarded-Host', request.host)
-            base_url = f"{scheme}://{host}"
+            proxy_base = f"{scheme}://{host}"
+            
+            endpoint = "/proxy/hls/manifest.m3u8"
+            if mediaflow_endpoint == "proxy_stream_endpoint" or ".mp4" in stream_url or ".mkv" in stream_url or ".avi" in stream_url:
+                 endpoint = "/proxy/stream"
+            elif ".mpd" in stream_url:
+                endpoint = "/proxy/mpd/manifest.m3u8"
+
+            encoded_url = urllib.parse.quote(stream_url, safe='')
+            header_params = "".join([f"&h_{urllib.parse.quote(key)}={urllib.parse.quote(value)}" for key, value in stream_headers.items()])
             
             api_password = request.query.get('api_password')
+            if api_password:
+                header_params += f"&api_password={api_password}"
+
+            proxy_url = f"{proxy_base}{endpoint}?d={encoded_url}{header_params}"
+
+            if redirect_stream:
+                logger.info(f"↪️ Redirecting to: {proxy_url}")
+                return web.HTTPFound(proxy_url)
+
+            response_data = {
+                "destination_url": stream_url,
+                "request_headers": stream_headers,
+                "mediaflow_endpoint": mediaflow_endpoint,
+                "mediaflow_proxy_url": proxy_url,
+                "query_params": {}
+            }
             
-            async def generate_response():
-                async for line in self.playlist_builder.async_generate_combined_playlist(
-                    playlist_definitions, base_url, api_password=api_password
-                ):
-                    yield line.encode('utf-8')
+            logger.info(f"✅ Extractor OK: {url} -> {stream_url[:50]}...")
+            return web.json_response(response_data)
+
+        except Exception as e:
+            error_message = str(e).lower()
+            is_expected_error = any(x in error_message for x in [
+                'not found', 'unavailable', '403', 'forbidden', 
+                '502', 'bad gateway', 'timeout', 'temporarily unavailable'
+            ])
             
-            response = web.StreamResponse(
-                status=200,
-                headers={
-                    'Content-Type': 'application/vnd.apple.mpegurl',
-                    'Content-Disposition': 'attachment; filename="playlist.m3u"',
-                    'Access-Control-Allow-Origin': '*'
-                }
-            )
+            if is_expected_error:
+                logger.warning(f"⚠️ Extractor request failed (expected error): {e}")
+            else:
+                logger.error(f"❌ Error in extractor request: {e}")
+                import traceback
+                traceback.print_exc()
             
-            await response.prepare(request)
+            return web.Response(text=str(e), status=500)
+
+    async def handle_license_request(self, request):
+        """Gestisce le richieste di licenza DRM (ClearKey e Proxy)"""
+        try:
+            # 1. Modalità ClearKey Statica
+            clearkey_param = request.query.get('clearkey')
+            if clearkey_param:
+                logger.info(f"🔑 Richiesta licenza ClearKey statica: {clearkey_param}")
+                try:
+                    kid_hex, key_hex = clearkey_param.split(':')
+                    def hex_to_b64url(hex_str):
+                        return base64.urlsafe_b64encode(binascii.unhexlify(hex_str)).decode('utf-8').rstrip('=')
+                    jwk_response = {
+                        "keys": [{
+                            "kty": "oct",
+                            "k": hex_to_b64url(key_hex),
+                            "kid": hex_to_b64url(kid_hex),
+                            "type": "temporary"
+                        }],
+                        "type": "temporary"
+                    }
+                    logger.info(f"🔑 Serving static ClearKey license for KID: {kid_hex}")
+                    return web.json_response(jwk_response)
+                except Exception as e:
+                    logger.error(f"❌ Errore nella generazione della licenza ClearKey statica: {e}")
+                    return web.Response(text="Invalid ClearKey format", status=400)
+
+            # 2. Modalità Proxy Licenza
+            license_url = request.query.get('url')
+            if not license_url:
+                return web.Response(text="Missing url parameter", status=400)
+
+            license_url = urllib.parse.unquote(license_url)
             
-            async for chunk in generate_response():
-                await response.write(chunk)
+            headers = {}
+            for param_name, param_value in request.query.items():
+                if param_name.startswith('h_'):
+                    header_name = param_name[2:].replace('_', '-')
+                    headers[header_name] = param_value
+
+            if request.headers.get('Content-Type'):
+                headers['Content-Type'] = request.headers.get('Content-Type')
+
+            body = await request.read()
+            logger.info(f"🔐 Proxying License Request to: {license_url}")
             
-            await response.write_eof()
-            return response
+            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
+            connector_kwargs = {}
+            if proxy:
+                connector_kwargs['proxy'] = proxy
+            
+            async with ClientSession() as session:
+                async with session.request(
+                    request.method, 
+                    license_url, 
+                    headers=headers, 
+                    data=body, 
+                    **connector_kwargs
+                ) as resp:
+                    response_body = await resp.read()
+                    logger.info(f"✅ License response: {resp.status} ({len(response_body)} bytes)")
+                    
+                    response_headers = {
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "*",
+                        "Access-Control-Allow-Methods": "GET, POST, OPTIONS"
+                    }
+                    if 'Content-Type' in resp.headers:
+                        response_headers['Content-Type'] = resp.headers['Content-Type']
+
+                    return web.Response(
+                        body=response_body,
+                        status=resp.status,
+                        headers=response_headers
+                    )
+
+        except Exception as e:
+            logger.error(f"❌ License proxy error: {str(e)}")
+            return web.Response(text=f"License error: {str(e)}", status=500)
+
+    async def handle_key_request(self, request):
+        """Gestisce richieste per chiavi AES-128"""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+
+        static_key = request.query.get('static_key')
+        if static_key:
+            try:
+                key_bytes = binascii.unhexlify(static_key)
+                return web.Response(
+                    body=key_bytes,
+                    content_type='application/octet-stream',
+                    headers={'Access-Control-Allow-Origin': '*'}
+                )
+            except Exception as e:
+                logger.error(f"❌ Errore decodifica chiave statica: {e}")
+                return web.Response(text="Invalid static key", status=400)
+
+        key_url = request.query.get('key_url')
+        
+        if not key_url:
+            return web.Response(text="Missing key_url or static_key parameter", status=400)
+        
+        try:
+            try:
+                key_url = urllib.parse.unquote(key_url)
+            except:
+                pass
+                
+            headers = {}
+            for param_name, param_value in request.query.items():
+                if param_name.startswith('h_'):
+                    header_name = param_name[2:].replace('_', '-')
+                    if header_name.lower() == 'range':
+                        continue
+                    headers[header_name] = param_value
+
+            logger.info(f"🔑 Fetching AES key from: {key_url}")
+            
+            proxy_list = GLOBAL_PROXIES
+            original_channel_url = request.query.get('original_channel_url')
+
+            if "newkso.ru" in key_url or (original_channel_url and any(domain in original_channel_url for domain in ["daddylive", "dlhd"])):
+                proxy_list = DLHD_PROXIES or GLOBAL_PROXIES
+            elif original_channel_url and "vavoo.to" in original_channel_url:
+                proxy_list = VAVOO_PROXIES or GLOBAL_PROXIES
+            
+            proxy = random.choice(proxy_list) if proxy_list else None
+            connector_kwargs = {}
+            if proxy:
+                connector_kwargs['proxy'] = proxy
+                logger.info(f"Utilizzo del proxy {proxy} per la richiesta della chiave.")
+            
+            timeout = ClientTimeout(total=30)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(key_url, headers=headers, **connector_kwargs) as resp:
+                    if resp.status == 200 or resp.status == 206:
+                        key_data = await resp.read()
+                        logger.info(f"✅ AES key fetched successfully: {len(key_data)} bytes")
+                        
+                        return web.Response(
+                            body=key_data,
+                            content_type="application/octet-stream",
+                            headers={
+                                "Access-Control-Allow-Origin": "*",
+                                "Access-Control-Allow-Headers": "*",
+                                "Cache-Control": "no-cache, no-store, must-revalidate"
+                            }
+                        )
+                    else:
+                        logger.error(f"❌ Key fetch failed with status: {resp.status}")
+                        try:
+                            url_param = request.query.get('original_channel_url')
+                            if url_param:
+                                extractor = await self.get_extractor(url_param, {})
+                                if hasattr(extractor, 'invalidate_cache_for_url'):
+                                    await extractor.invalidate_cache_for_url(url_param)
+                        except Exception as cache_e:
+                            logger.error(f"⚠️ Errore durante l'invalidazione automatica della cache: {cache_e}")
+                        return web.Response(text=f"Key fetch failed: {resp.status}", status=resp.status)
+                        
+        except Exception as e:
+            logger.error(f"❌ Error fetching AES key: {str(e)}")
+            return web.Response(text=f"Key error: {str(e)}", status=500)
+
+    async def handle_ts_segment(self, request):
+        """Gestisce richieste per segmenti .ts"""
+        try:
+            segment_name = request.match_info.get('segment')
+            base_url = request.query.get('base_url')
+            
+            if not base_url:
+                return web.Response(text="Base URL mancante per segmento", status=400)
+            
+            base_url = urllib.parse.unquote(base_url)
+            
+            if base_url.endswith('/'):
+                segment_url = f"{base_url}{segment_name}"
+            else:
+                if any(ext in base_url for ext in ['.mp4', '.m4s', '.ts', '.m4i', '.m4a', '.m4v']):
+                    segment_url = base_url
+                else:
+                    segment_url = f"{base_url.rsplit('/', 1)[0]}/{segment_name}"
+            
+            logger.info(f"📦 Proxy Segment: {segment_name}")
+            
+            # ✅ FIX: Usa sempre DEFAULT_USER_AGENT
+            return await self._proxy_segment(request, segment_url, {
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Referer": base_url
+            }, segment_name)
             
         except Exception as e:
-            logger.error(f"Errore generale nel playlist handler: {str(e)}")
-            return web.Response(text=f"Errore: {str(e)}", status=500)
+            logger.error(f"Errore nel proxy segmento .ts: {str(e)}")
+            return web.Response(text=f"Errore segmento: {str(e)}", status=500)
+
+    async def _proxy_segment(self, request, segment_url, stream_headers, segment_name):
+        """Proxy dedicato per segmenti .ts con Content-Disposition"""
+        try:
+            # ✅ FIX: Sovrascrivi sempre User-Agent con quello Chrome
+            headers = dict(stream_headers)
+            headers['User-Agent'] = DEFAULT_USER_AGENT
+            
+            # Passa attraverso alcuni headers del client
+            for header in ['range', 'if-none-match', 'if-modified-since']:
+                if header in request.headers:
+                    headers[header] = request.headers[header]
+            
+            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
+            connector_kwargs = {}
+            if proxy:
+                connector_kwargs['proxy'] = proxy
+                logger.debug(f"📡 [Proxy Segment] Utilizzo del proxy {proxy} per il segmento .ts")
+
+            timeout = ClientTimeout(total=60, connect=30)
+            async with ClientSession(timeout=timeout) as session:
+                async with session.get(segment_url, headers=headers, **connector_kwargs) as resp:
+                    response_headers = {}
+                    
+                    for header in ['content-type', 'content-length', 'content-range', 
+                                 'accept-ranges', 'last-modified', 'etag']:
+                        if header in resp.headers:
+                            response_headers[header] = resp.headers[header]
+                    
+                    # Forza il content-type e aggiunge Content-Disposition per .ts
+                    response_headers['Content-Type'] = 'video/MP2T'
+                    response_headers['Content-Disposition'] = f'attachment; filename="{segment_name}"'
+                    response_headers['Access-Control-Allow-Origin'] = '*'
+                    response_headers['Access-Control-Allow-Methods'] = 'GET, HEAD, OPTIONS'
+                    response_headers['Access-Control-Allow-Headers'] = 'Range, Content-Type'
+                    
+                    response = web.StreamResponse(
+                        status=resp.status,
+                        headers=response_headers
+                    )
+                    
+                    await response.prepare(request)
+                    
+                    async for chunk in resp.content.iter_chunked(8192):
+                        await response.write(chunk)
+                    
+                    await response.write_eof()
+                    return response
+                    
+        except Exception as e:
+            logger.error(f"Errore nel proxy del segmento: {str(e)}")
+            return web.Response(text=f"Errore segmento: {str(e)}", status=500)
+
+    async def handle_proxy_ip(self, request):
+        """Restituisce l'indirizzo IP pubblico del server (o del proxy se configurato)."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+
+        try:
+            # Usa un proxy globale se configurato, altrimenti connessione diretta
+            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
+            
+            # Crea una sessione dedicata con il proxy configurato
+            if proxy:
+                logger.info(f"🌍 Checking IP via proxy: {proxy}")
+                connector = ProxyConnector.from_url(proxy)
+            else:
+                connector = TCPConnector()
+            
+            timeout = ClientTimeout(total=10)
+            async with ClientSession(timeout=timeout, connector=connector) as session:
+                # Usa un servizio esterno per determinare l'IP pubblico
+                async with session.get('https://api.ipify.org?format=json') as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return web.json_response(data)
+                    else:
+                        logger.error(f"❌ Failed to fetch IP: {resp.status}")
+                        return web.Response(text="Failed to fetch IP", status=502)
+                    
+        except Exception as e:
+            logger.error(f"❌ Error fetching IP: {e}")
+            return web.Response(text=str(e), status=500)
 
     def _read_template(self, filename: str) -> str:
         """Funzione helper per leggere un file di template."""
@@ -1397,6 +1451,7 @@ class HLSProxy:
                 "mixdrop_extractor": MixdropExtractor is not None,
                 "voe_extractor": VoeExtractor is not None,
                 "streamtape_extractor": StreamtapeExtractor is not None,
+                "orion_extractor": OrionExtractor is not None,
             },
             "proxy_config": {
                 "global": f"{len(GLOBAL_PROXIES)} proxies caricati",
@@ -1424,168 +1479,6 @@ class HLSProxy:
             }
         }
         return web.json_response(info)
-
-    async def handle_decrypt_segment(self, request):
-        """✅ Decritta segmenti fMP4 lato server usando Python (PyCryptodome)."""
-        if not check_password(request):
-            return web.Response(status=401, text="Unauthorized: Invalid API Password")
-
-        url = request.query.get('url')
-        init_url = request.query.get('init_url')
-        key = request.query.get('key')
-        key_id = request.query.get('key_id')
-        
-        if not url or not key or not key_id:
-            return web.Response(text="Missing url, key, or key_id", status=400)
-
-        try:
-            headers = {}
-            for param_name, param_value in request.query.items():
-                if param_name.startswith('h_'):
-                    header_name = param_name[2:].replace('_', '-')
-                    headers[header_name] = param_value
-
-            session = await self._get_session()
-
-            # --- 1. Scarica Initialization Segment (con cache) ---
-            init_content = b""
-            if init_url:
-                if init_url in self.init_cache:
-                    init_content = self.init_cache[init_url]
-                else:
-                    async with session.get(init_url, headers=headers, ssl=False) as resp:
-                        if resp.status == 200:
-                            init_content = await resp.read()
-                            self.init_cache[init_url] = init_content
-                        else:
-                            logger.error(f"❌ Failed to fetch init segment: {resp.status}")
-                            return web.Response(status=502)
-
-            # --- 2. Scarica Media Segment ---
-            async with session.get(url, headers=headers, ssl=False) as resp:
-                if resp.status != 200:
-                    logger.error(f"❌ Failed to fetch segment: {resp.status}")
-                    return web.Response(status=502)
-                
-                segment_content = await resp.read()
-
-            # --- 3. Decritta con Python (PyCryptodome) ---
-            decrypted_content = decrypt_segment(init_content, segment_content, key_id, key)
-
-            # --- 4. Invia Risposta ---
-            return web.Response(
-                body=decrypted_content,
-                status=200,
-                headers={'Content-Type': 'video/mp4', 'Access-Control-Allow-Origin': '*'}
-            )
-
-        except Exception as e:
-            logger.error(f"❌ Decryption error: {e}")
-            import traceback
-            traceback.print_exc()
-            return web.Response(status=500, text=f"Decryption failed: {str(e)}")
-
-    async def handle_generate_urls(self, request):
-        """
-        Endpoint compatibile con MediaFlow-Proxy per generare URL proxy.
-        Supporta la richiesta POST da ilCorsaroViola.
-        """
-        try:
-            data = await request.json()
-            
-            # Verifica password se presente nel body (ilCorsaroViola la manda qui)
-            req_password = data.get('api_password')
-            if API_PASSWORD and req_password != API_PASSWORD:
-                 # Fallback: check standard auth methods if body auth fails or is missing
-                 if not check_password(request):
-                    logger.warning("⛔ Unauthorized generate_urls request")
-                    return web.Response(status=401, text="Unauthorized: Invalid API Password")
-
-            urls_to_process = data.get('urls', [])
-            
-            client_ip = request.remote
-            exit_strategy = "IP del Server (Diretto)"
-            if GLOBAL_PROXIES:
-                exit_strategy = f"Proxy Globale Random (Pool di {len(GLOBAL_PROXIES)} proxy)"
-            
-            logger.info(f"🔄 [Generate URLs] Richiesta da Client IP: {client_ip}")
-            logger.info(f"    -> Strategia di uscita prevista per lo stream: {exit_strategy}")
-            if urls_to_process:
-                logger.info(f"    -> Generazione di {len(urls_to_process)} URL proxy per destinazione: {urls_to_process[0].get('destination_url', 'N/A')}")
-
-            generated_urls = []
-            
-            # Determina base URL del proxy
-            scheme = request.headers.get('X-Forwarded-Proto', request.scheme)
-            host = request.headers.get('X-Forwarded-Host', request.host)
-            proxy_base = f"{scheme}://{host}"
-
-            for item in urls_to_process:
-                dest_url = item.get('destination_url')
-                if not dest_url:
-                    continue
-                    
-                endpoint = item.get('endpoint', '/proxy/stream')
-                req_headers = item.get('request_headers', {})
-                
-                # Costruisci query params
-                encoded_url = urllib.parse.quote(dest_url, safe='')
-                params = [f"d={encoded_url}"]
-                
-                # Aggiungi headers come h_ params
-                for key, value in req_headers.items():
-                    params.append(f"h_{urllib.parse.quote(key)}={urllib.parse.quote(value)}")
-                
-                # Aggiungi password se necessaria
-                if API_PASSWORD:
-                    params.append(f"api_password={API_PASSWORD}")
-                
-                # Costruisci URL finale
-                query_string = "&".join(params)
-                
-                # Assicuriamoci che l'endpoint inizi con /
-                if not endpoint.startswith('/'):
-                    endpoint = '/' + endpoint
-                
-                full_url = f"{proxy_base}{endpoint}?{query_string}"
-                generated_urls.append(full_url)
-
-            return web.json_response({"urls": generated_urls})
-
-        except Exception as e:
-            logger.error(f"❌ Error generating URLs: {e}")
-            return web.Response(text=str(e), status=500)
-
-    async def handle_proxy_ip(self, request):
-        """Restituisce l'indirizzo IP pubblico del server (o del proxy se configurato)."""
-        if not check_password(request):
-            return web.Response(status=401, text="Unauthorized: Invalid API Password")
-
-        try:
-            # Usa un proxy globale se configurato, altrimenti connessione diretta
-            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
-            
-            # Crea una sessione dedicata con il proxy configurato
-            if proxy:
-                logger.info(f"🌍 Checking IP via proxy: {proxy}")
-                connector = ProxyConnector.from_url(proxy)
-            else:
-                connector = TCPConnector()
-            
-            timeout = ClientTimeout(total=10)
-            async with ClientSession(timeout=timeout, connector=connector) as session:
-                # Usa un servizio esterno per determinare l'IP pubblico
-                async with session.get('https://api.ipify.org?format=json') as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return web.json_response(data)
-                    else:
-                        logger.error(f"❌ Failed to fetch IP: {resp.status}")
-                        return web.Response(text="Failed to fetch IP", status=502)
-                    
-        except Exception as e:
-            logger.error(f"❌ Error fetching IP: {e}")
-            return web.Response(text=str(e), status=500)
 
     async def cleanup(self):
         """Pulizia delle risorse"""
