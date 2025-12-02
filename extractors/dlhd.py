@@ -239,7 +239,7 @@ class DLHDExtractor:
             if self._cached_base_url and not force_refresh:
                 return self._cached_base_url
             
-            DOMAINS = ['https://daddylive.sx/', 'https://dlhd.dad/']
+            DOMAINS = ['https://daddylive.sx/', 'https://daddyhd.com/']
             for base in DOMAINS:
                 try:
                     resp = await self._make_robust_request(base, retries=1)
