@@ -183,6 +183,7 @@ class MPDToHLSConverter:
             # Decrittazione lato server con mp4decrypt
             server_side_decryption = False
             decryption_params = ""
+            key_count = 0  # Track number of keys for multi-key optimization
             
             if clearkey_param:
                 try:
@@ -371,9 +372,9 @@ class MPDToHLSConverter:
                         header_params = self._extract_header_params(params)
                         
                         if server_side_decryption:
-                            # Usa endpoint di decrittazione
-                            # Passiamo init_url perché serve per la concatenazione
-                            decrypt_url = f"{proxy_base}/decrypt/segment.ts?url={encoded_seg_url}&init_url={encoded_init_url}{decryption_params}{header_params}"
+                            # For multi-key (2+), skip FFmpeg remux for better performance
+                            skip_remux_param = "&skip_remux=1" if key_count >= 2 else ""
+                            decrypt_url = f"{proxy_base}/decrypt/segment.ts?url={encoded_seg_url}&init_url={encoded_init_url}{skip_remux_param}{decryption_params}{header_params}"
                             lines.append(decrypt_url)
                         else:
                             # Proxy standard - usa filename senza query string per evitare doppio ?
