@@ -115,9 +115,8 @@ class HLSProxy:
         # Cache per segmenti di inizializzazione (URL -> content)
         self.init_cache = {}
         
-        # Cache per segmenti decriptati (URL -> (content, timestamp))
         self.segment_cache = {}
-        self.segment_cache_ttl = 30  # Seconds
+        self.segment_cache_ttl = 60  # Seconds (increased from 30 for multi-key streams)
         
         # Prefetch queue for background downloading
         self.prefetch_tasks = set()
@@ -1347,8 +1346,8 @@ class HLSProxy:
             separator, current_number, extension = match.groups()
             current_num = int(current_number)
 
-            # Prefetch next 3 segments
-            for i in range(1, 4):
+            # Prefetch next 5 segments (increased from 3 for smoother multi-key playback)
+            for i in range(1, 6):
                 next_num = current_num + i
                 
                 # Replace number in path
@@ -1556,23 +1555,32 @@ class HLSProxy:
                 loop = asyncio.get_event_loop()
                 combined_content = await loop.run_in_executor(None, decrypt_segment, init_content, segment_content, key_id, key)
 
-            # Leggero REMUX to TS
-            ts_content = await self._remux_to_ts(combined_content)
-            if not ts_content:
-                 logger.warning("⚠️ Remux failed, serving raw fMP4")
-                 # Fallback: serve fMP4 if remux fails
-                 ts_content = combined_content
-                 content_type = 'video/mp4'
+            # Check if we should skip remux (fMP4 -> TS) for faster playback
+            # Most modern players (VLC, ffplay, mpv) can handle fMP4 directly
+            skip_remux = request.query.get('skip_remux') == '1'
+            
+            if skip_remux:
+                # Serve decrypted fMP4 directly - much faster!
+                logger.info("⚡ Skip remux - serving fMP4 directly")
+                ts_content = combined_content
+                content_type = 'video/mp4'
             else:
-                 content_type = 'video/MP2T'
-                 logger.info("⚡ Remuxed fMP4 -> TS")
+                # Legacy: Remux to TS for players that need it (slower)
+                ts_content = await self._remux_to_ts(combined_content)
+                if not ts_content:
+                     logger.warning("⚠️ Remux failed, serving raw fMP4")
+                     ts_content = combined_content
+                     content_type = 'video/mp4'
+                else:
+                     content_type = 'video/MP2T'
+                     logger.info("⚡ Remuxed fMP4 -> TS")
 
             # Store in cache
             self.segment_cache[cache_key] = (ts_content, time.time())
             
-            # Clean old cache entries (keep max 50)
-            if len(self.segment_cache) > 50:
-                oldest_keys = sorted(self.segment_cache.keys(), key=lambda k: self.segment_cache[k][1])[:20]
+            # Clean old cache entries (keep max 150 for multi-key streams)
+            if len(self.segment_cache) > 150:
+                oldest_keys = sorted(self.segment_cache.keys(), key=lambda k: self.segment_cache[k][1])[:50]
                 for k in oldest_keys:
                     del self.segment_cache[k]
 
