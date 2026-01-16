@@ -8,8 +8,11 @@ import urllib.parse
 from urllib.parse import urlparse, urljoin
 import base64
 import binascii
+import hashlib
+import hmac
 import json
 import ssl
+import time
 import aiohttp
 from aiohttp import web, ClientSession, ClientTimeout, TCPConnector, ClientPayloadError, ServerDisconnectedError, ClientConnectionError
 from aiohttp_socks import ProxyConnector
@@ -128,6 +131,54 @@ class HLSProxy:
         # Cache for proxy sessions (proxy_url -> session)
         # This reuses connections for the same proxy to improve performance
         self.proxy_sessions = {}
+
+    @staticmethod
+    def _compute_key_headers(key_url: str, secret_key: str) -> tuple[int, int] | None:
+        """
+        Compute X-Key-Timestamp and X-Key-Nonce for a /key/ URL.
+
+        Algorithm:
+        1. Extract resource and number from URL pattern /key/{resource}/{number}
+        2. ts = Unix timestamp in seconds
+        3. hmac_hash = HMAC-SHA256(resource, secret_key).hex()
+        4. nonce = proof-of-work: find i where MD5(hmac+resource+number+ts+i)[:4] < 0x1000
+
+        Args:
+            key_url: The key URL containing /key/{resource}/{number}
+            secret_key: The HMAC secret key
+
+        Returns:
+            Tuple of (timestamp, nonce) or None if URL doesn't match pattern
+        """
+        # Extract resource and number from URL
+        pattern = r"/key/([^/]+)/(\d+)"
+        match = re.search(pattern, key_url)
+
+        if not match:
+            return None
+
+        resource = match.group(1)
+        number = match.group(2)
+
+        ts = int(time.time())
+
+        # Compute HMAC-SHA256
+        hmac_hash = hmac.new(
+            secret_key.encode("utf-8"), resource.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
+
+        # Proof-of-work loop
+        nonce = 0
+        for i in range(100000):
+            combined = f"{hmac_hash}{resource}{number}{ts}{i}"
+            md5_hash = hashlib.md5(combined.encode("utf-8")).hexdigest()
+            prefix_value = int(md5_hash[:4], 16)
+
+            if prefix_value < 0x1000:  # < 4096
+                nonce = i
+                break
+
+        return ts, nonce
 
     async def _get_session(self):
         if self.session is None or self.session.closed:
@@ -908,29 +959,26 @@ class HLSProxy:
             
             timeout = ClientTimeout(total=30)
             async with ClientSession(timeout=timeout) as session:
-                # ✅ DLHD Heartbeat: Necessario per stabilire la sessione prima di ricevere le chiavi
-                # Usa Heartbeat-Url header per rilevare stream DLHD (completamente dinamico)
-                heartbeat_url = headers.pop('Heartbeat-Url', None)  # Rimuovilo dagli headers
-                client_token = headers.pop('X-Client-Token', None)  # ✅ Token per heartbeat
-                if heartbeat_url:
-                    try:
-                        
-                        hb_headers = {
-                            'Authorization': headers.get('Authorization', ''),
-                            'X-Channel-Key': headers.get('X-Channel-Key', ''),
-                            'User-Agent': headers.get('User-Agent', 'Mozilla/5.0'),
-                            'Referer': headers.get('Referer', ''),
-                            'Origin': headers.get('Origin', ''),
-                            'X-Client-Token': client_token or '',  # ✅ Token richiesto dal provider
-                        }
-                        
-                        logger.info(f"💓 Pre-key heartbeat a: {heartbeat_url}")
-                        async with session.get(heartbeat_url, headers=hb_headers, ssl=False, **connector_kwargs) as hb_resp:
-                            hb_text = await hb_resp.text()
-                            logger.info(f"💓 Heartbeat response: {hb_resp.status} - {hb_text[:100]}")
-                    except Exception as hb_e:
-                        logger.warning(f"⚠️ Pre-key heartbeat fallito: {hb_e}")
-                
+                secret_key = headers.pop('X-Secret-Key', None)
+
+                # Calcola X-Key-Timestamp e X-Key-Nonce se abbiamo la secret_key
+                if secret_key and '/key/' in key_url:
+                    nonce_result = self._compute_key_headers(key_url, secret_key)
+                    if nonce_result:
+                        ts, nonce = nonce_result
+                        headers['X-Key-Timestamp'] = str(ts)
+                        headers['X-Key-Nonce'] = str(nonce)
+                        logger.info(f"🔐 Computed nonce headers: ts={ts}, nonce={nonce}")
+                    else:
+                        logger.warning(f"⚠️ Could not compute nonce headers for {key_url}")
+
+                # Caso 'auth' - URL che contengono 'auth' richiedono headers speciali
+                if 'auth' in key_url.lower():
+                    logger.info(f"🔐 Detected 'auth' key URL, ensuring special headers are present")
+                    if 'X-User-Agent' not in headers:
+                        headers['X-User-Agent'] = headers.get('User-Agent', headers.get('user-agent', 'Mozilla/5.0'))
+                    logger.info(f"🔐 Auth key headers: Authorization={'***' if headers.get('Authorization') else 'missing'}, X-Channel-Key={headers.get('X-Channel-Key', 'missing')}, X-User-Agent={headers.get('X-User-Agent', 'missing')}")
+
                 async with session.get(key_url, headers=headers, **connector_kwargs) as resp:
                     if resp.status == 200 or resp.status == 206:
                         key_data = await resp.read()
